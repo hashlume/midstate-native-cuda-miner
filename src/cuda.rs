@@ -1,0 +1,309 @@
+use std::ffi::{c_char, c_void, CStr};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, RwLock};
+use std::thread;
+use std::time::Duration;
+
+use anyhow::{anyhow, bail, Context, Result};
+use tokio::sync::mpsc;
+
+use crate::protocol::Job;
+
+pub const MAX_CANDIDATES: usize = 512;
+
+#[repr(C)]
+struct NativeResult {
+    count: u32,
+    checked: u64,
+    elapsed_ms: f64,
+    nonce: [u64; MAX_CANDIDATES],
+    hash: [[u8; 32]; MAX_CANDIDATES],
+}
+
+unsafe extern "C" {
+    fn midstate_cuda_device_count() -> i32;
+    fn midstate_cuda_device_name(device: i32, output: *mut c_char, output_len: u32) -> i32;
+    fn midstate_cuda_worker_create(
+        device: i32,
+        blocks: i32,
+        threads: i32,
+        batch: u64,
+        iterations: u32,
+    ) -> *mut c_void;
+    fn midstate_cuda_worker_set_job(
+        worker: *mut c_void,
+        midstate: *const u8,
+        target: *const u8,
+    ) -> i32;
+    fn midstate_cuda_worker_mine(worker: *mut c_void, base: u64, result: *mut NativeResult) -> i32;
+    fn midstate_cuda_hash_one(
+        device: i32,
+        midstate: *const u8,
+        nonce: u64,
+        iterations: u32,
+        output: *mut u8,
+    ) -> i32;
+    fn midstate_cuda_worker_destroy(worker: *mut c_void);
+    fn midstate_cuda_last_error() -> *const c_char;
+}
+
+#[derive(Clone, Debug)]
+pub struct Candidate {
+    pub nonce: u64,
+    pub hash: [u8; 32],
+}
+
+#[derive(Debug)]
+pub struct BatchEvent {
+    pub gpu: usize,
+    pub generation: u64,
+    pub job_id: u64,
+    pub checked: u64,
+    pub elapsed_ms: f64,
+    pub candidates: Vec<Candidate>,
+}
+
+#[derive(Debug)]
+pub struct WorkerStats {
+    pub name: String,
+    pub hashes: AtomicU64,
+    pub batches: AtomicU64,
+    pub candidates: AtomicU64,
+    pub hps_bits: AtomicU64,
+    pub job_id: AtomicU64,
+}
+
+impl WorkerStats {
+    pub fn hps(&self) -> f64 {
+        f64::from_bits(self.hps_bits.load(Ordering::Relaxed))
+    }
+}
+
+#[derive(Default)]
+pub struct SharedJob {
+    generation: AtomicU64,
+    job: RwLock<Option<Job>>,
+}
+
+impl SharedJob {
+    pub fn publish(&self, mut job: Job) -> Job {
+        let generation = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
+        job.generation = generation;
+        *self.job.write().unwrap() = Some(job.clone());
+        job
+    }
+
+    pub fn clear(&self) {
+        self.generation.fetch_add(1, Ordering::SeqCst);
+        *self.job.write().unwrap() = None;
+    }
+
+    fn current(&self) -> Option<Job> {
+        self.job.read().unwrap().clone()
+    }
+}
+
+fn native_error() -> String {
+    unsafe {
+        let pointer = midstate_cuda_last_error();
+        if pointer.is_null() {
+            "unknown CUDA error".to_string()
+        } else {
+            CStr::from_ptr(pointer).to_string_lossy().into_owned()
+        }
+    }
+}
+
+pub fn device_count() -> Result<usize> {
+    let count = unsafe { midstate_cuda_device_count() };
+    if count < 0 {
+        bail!("CUDA device discovery failed: {}", native_error());
+    }
+    Ok(count as usize)
+}
+
+fn device_name(device: usize) -> Result<String> {
+    let mut buffer = [0 as c_char; 256];
+    let result = unsafe {
+        midstate_cuda_device_name(device as i32, buffer.as_mut_ptr(), buffer.len() as u32)
+    };
+    if result != 0 {
+        bail!("GPU {device} name query failed: {}", native_error());
+    }
+    Ok(unsafe { CStr::from_ptr(buffer.as_ptr()) }
+        .to_string_lossy()
+        .into_owned())
+}
+
+fn extension_hash(midstate: &[u8; 32], nonce: u64, iterations: u32) -> [u8; 32] {
+    let mut preimage = [0u8; 40];
+    preimage[..32].copy_from_slice(midstate);
+    preimage[32..].copy_from_slice(&nonce.to_le_bytes());
+    let mut hash = *blake3::hash(&preimage).as_bytes();
+    for _ in 0..iterations {
+        hash = *blake3::hash(&hash).as_bytes();
+    }
+    hash
+}
+
+fn self_test(device: usize, iterations: u32) -> Result<()> {
+    let midstate = [0xa5; 32];
+    let nonce = 0x0123_4567_89ab_cdef;
+    let expected = extension_hash(&midstate, nonce, iterations);
+    let mut actual = [0u8; 32];
+    let result = unsafe {
+        midstate_cuda_hash_one(
+            device as i32,
+            midstate.as_ptr(),
+            nonce,
+            iterations,
+            actual.as_mut_ptr(),
+        )
+    };
+    if result != 0 {
+        bail!("GPU {device} self-test failed to run: {}", native_error());
+    }
+    if actual != expected {
+        bail!(
+            "GPU {device} self-test mismatch: CUDA={} CPU={}",
+            hex::encode(actual),
+            hex::encode(expected)
+        );
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy)]
+pub struct WorkerConfig {
+    pub blocks: i32,
+    pub threads: i32,
+    pub batch: u64,
+    pub iterations: u32,
+}
+
+pub fn start_workers(
+    config: WorkerConfig,
+    jobs: Arc<SharedJob>,
+    stop: Arc<AtomicBool>,
+    events: mpsc::Sender<BatchEvent>,
+) -> Result<(Vec<Arc<WorkerStats>>, Vec<thread::JoinHandle<Result<()>>>)> {
+    let count = device_count()?;
+    if count == 0 {
+        bail!("no NVIDIA CUDA devices found");
+    }
+
+    let mut stats = Vec::with_capacity(count);
+    let mut handles = Vec::with_capacity(count);
+    for gpu in 0..count {
+        let name = device_name(gpu).with_context(|| format!("GPU {gpu}"))?;
+        let gpu_stats = Arc::new(WorkerStats {
+            name,
+            hashes: AtomicU64::new(0),
+            batches: AtomicU64::new(0),
+            candidates: AtomicU64::new(0),
+            hps_bits: AtomicU64::new(0.0f64.to_bits()),
+            job_id: AtomicU64::new(0),
+        });
+        stats.push(gpu_stats.clone());
+
+        let jobs = jobs.clone();
+        let stop = stop.clone();
+        let events = events.clone();
+        let gpu_count = count as u64;
+        let config = WorkerConfig { ..config };
+        handles.push(thread::spawn(move || {
+            self_test(gpu, config.iterations)?;
+            let worker = unsafe {
+                midstate_cuda_worker_create(
+                    gpu as i32,
+                    config.blocks,
+                    config.threads,
+                    config.batch,
+                    config.iterations,
+                )
+            };
+            if worker.is_null() {
+                bail!("GPU {gpu} initialization failed: {}", native_error());
+            }
+
+            let run = || -> Result<()> {
+                let mut active_generation = 0;
+                let mut active_job = 0;
+                let mut share_target = [0xff; 32];
+                share_target[0] = 0x00;
+                share_target[1] = 0x0f;
+                let seed = ((std::process::id() as u64) << 32)
+                    ^ (gpu as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+                let mut base = seed.wrapping_add((gpu as u64).wrapping_mul(config.batch));
+
+                while !stop.load(Ordering::Relaxed) {
+                    let Some(job) = jobs.current() else {
+                        thread::sleep(Duration::from_millis(100));
+                        continue;
+                    };
+                    if job.generation != active_generation {
+                        let result = unsafe {
+                            midstate_cuda_worker_set_job(
+                                worker,
+                                job.midstate.as_ptr(),
+                                share_target.as_ptr(),
+                            )
+                        };
+                        if result != 0 {
+                            bail!("GPU {gpu} job setup failed: {}", native_error());
+                        }
+                        active_generation = job.generation;
+                        active_job = job.id;
+                        gpu_stats.job_id.store(job.id, Ordering::Relaxed);
+                    }
+
+                    let mut native: NativeResult = unsafe { std::mem::zeroed() };
+                    let result = unsafe { midstate_cuda_worker_mine(worker, base, &mut native) };
+                    if result != 0 {
+                        bail!("GPU {gpu} batch failed: {}", native_error());
+                    }
+                    base = base.wrapping_add(config.batch.wrapping_mul(gpu_count));
+                    let count = usize::min(native.count as usize, MAX_CANDIDATES);
+                    let candidates = (0..count)
+                        .map(|index| Candidate {
+                            nonce: native.nonce[index],
+                            hash: native.hash[index],
+                        })
+                        .collect::<Vec<_>>();
+                    let hps = if native.elapsed_ms > 0.0 {
+                        native.checked as f64 / (native.elapsed_ms / 1000.0)
+                    } else {
+                        0.0
+                    };
+                    gpu_stats
+                        .hashes
+                        .fetch_add(native.checked, Ordering::Relaxed);
+                    gpu_stats.batches.fetch_add(1, Ordering::Relaxed);
+                    gpu_stats
+                        .candidates
+                        .fetch_add(count as u64, Ordering::Relaxed);
+                    gpu_stats.hps_bits.store(hps.to_bits(), Ordering::Relaxed);
+
+                    if active_generation == job.generation && active_job == job.id {
+                        events
+                            .blocking_send(BatchEvent {
+                                gpu,
+                                generation: job.generation,
+                                job_id: job.id,
+                                checked: native.checked,
+                                elapsed_ms: native.elapsed_ms,
+                                candidates,
+                            })
+                            .map_err(|_| anyhow!("network event channel closed"))?;
+                    }
+                }
+                Ok(())
+            }();
+
+            unsafe { midstate_cuda_worker_destroy(worker) };
+            run
+        }));
+    }
+
+    Ok((stats, handles))
+}
