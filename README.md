@@ -29,6 +29,8 @@ RTX 5090:    sm_120
 - Ordinary share traffic is bounded independently of block discovery.
 - Structured JSON parsing for jobs, targets, responses, and errors.
 - Clean Ctrl+C shutdown after active CUDA batches finish.
+- Register-resident BLAKE3 chaining state across all one million iterations.
+- Launch grids are clamped to useful nonce work instead of scheduling empty blocks.
 
 The pool sees one logical worker because all GPUs deliberately share one
 connection. Per-GPU rates, candidates, jobs, and totals are printed locally.

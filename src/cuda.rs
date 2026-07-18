@@ -307,3 +307,150 @@ pub fn start_workers(
 
     Ok((stats, handles))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::extension_hash;
+
+    const IV: [u32; 8] = [
+        0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab,
+        0x5be0cd19,
+    ];
+    const SCHEDULE: [[usize; 16]; 7] = [
+        [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
+        [2, 6, 3, 10, 7, 0, 4, 13, 1, 11, 12, 5, 9, 14, 15, 8],
+        [3, 4, 10, 12, 13, 2, 7, 14, 6, 5, 9, 0, 11, 15, 8, 1],
+        [10, 7, 12, 9, 14, 3, 13, 15, 4, 0, 11, 2, 5, 8, 1, 6],
+        [12, 13, 9, 11, 15, 10, 14, 8, 7, 2, 5, 3, 0, 1, 6, 4],
+        [9, 14, 11, 5, 8, 12, 15, 1, 13, 3, 0, 10, 2, 6, 4, 7],
+        [11, 15, 5, 0, 1, 9, 8, 6, 14, 10, 2, 12, 3, 4, 7, 13],
+    ];
+
+    fn mix(v: &mut [u32; 16], a: usize, b: usize, c: usize, d: usize, x: u32, y: u32) {
+        v[a] = v[a].wrapping_add(v[b]).wrapping_add(x);
+        v[d] = (v[d] ^ v[a]).rotate_right(16);
+        v[c] = v[c].wrapping_add(v[d]);
+        v[b] = (v[b] ^ v[c]).rotate_right(12);
+        v[a] = v[a].wrapping_add(v[b]).wrapping_add(y);
+        v[d] = (v[d] ^ v[a]).rotate_right(8);
+        v[c] = v[c].wrapping_add(v[d]);
+        v[b] = (v[b] ^ v[c]).rotate_right(7);
+    }
+
+    fn compress(input: [u32; 8], word8: u32, word9: u32, length: u32) -> [u32; 8] {
+        let mut message = [0u32; 16];
+        message[..8].copy_from_slice(&input);
+        message[8] = word8;
+        message[9] = word9;
+        let mut v = [0u32; 16];
+        v[..8].copy_from_slice(&IV);
+        v[8..].copy_from_slice(&IV);
+        v[12] = 0;
+        v[13] = 0;
+        v[14] = length;
+        v[15] = 11;
+        for schedule in SCHEDULE {
+            mix(
+                &mut v,
+                0,
+                4,
+                8,
+                12,
+                message[schedule[0]],
+                message[schedule[1]],
+            );
+            mix(
+                &mut v,
+                1,
+                5,
+                9,
+                13,
+                message[schedule[2]],
+                message[schedule[3]],
+            );
+            mix(
+                &mut v,
+                2,
+                6,
+                10,
+                14,
+                message[schedule[4]],
+                message[schedule[5]],
+            );
+            mix(
+                &mut v,
+                3,
+                7,
+                11,
+                15,
+                message[schedule[6]],
+                message[schedule[7]],
+            );
+            mix(
+                &mut v,
+                0,
+                5,
+                10,
+                15,
+                message[schedule[8]],
+                message[schedule[9]],
+            );
+            mix(
+                &mut v,
+                1,
+                6,
+                11,
+                12,
+                message[schedule[10]],
+                message[schedule[11]],
+            );
+            mix(
+                &mut v,
+                2,
+                7,
+                8,
+                13,
+                message[schedule[12]],
+                message[schedule[13]],
+            );
+            mix(
+                &mut v,
+                3,
+                4,
+                9,
+                14,
+                message[schedule[14]],
+                message[schedule[15]],
+            );
+        }
+        std::array::from_fn(|index| v[index] ^ v[index + 8])
+    }
+
+    fn word_hash(midstate: [u8; 32], nonce: u64, iterations: u32) -> [u8; 32] {
+        let input = std::array::from_fn(|index| {
+            u32::from_le_bytes(midstate[index * 4..index * 4 + 4].try_into().unwrap())
+        });
+        let mut state = compress(input, nonce as u32, (nonce >> 32) as u32, 40);
+        for _ in 0..iterations {
+            state = compress(state, 0, 0, 32);
+        }
+        let mut output = [0u8; 32];
+        for (index, word) in state.into_iter().enumerate() {
+            output[index * 4..index * 4 + 4].copy_from_slice(&word.to_le_bytes());
+        }
+        output
+    }
+
+    #[test]
+    fn word_state_matches_blake3_reference() {
+        for iterations in [0, 1, 7] {
+            for nonce in [0, 1, 0x0123_4567_89ab_cdef] {
+                let midstate = [0xa5; 32];
+                assert_eq!(
+                    word_hash(midstate, nonce, iterations),
+                    extension_hash(&midstate, nonce, iterations)
+                );
+            }
+        }
+    }
+}

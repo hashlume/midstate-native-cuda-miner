@@ -64,7 +64,12 @@ __device__ __forceinline__ void store32(uint8_t *p, uint32_t x) {
     p[3] = (uint8_t)(x >> 24);
 }
 
-__device__ void blake3_oneblock_words(const uint32_t m[16], uint32_t block_len, uint8_t out[32]) {
+__device__ __forceinline__ void blake3_compress_words(
+    const uint32_t input[8],
+    uint32_t word8,
+    uint32_t word9,
+    uint32_t block_len,
+    uint32_t output[8]) {
     const uint32_t IV[8] = {
         0x6A09E667u, 0xBB67AE85u, 0x3C6EF372u, 0xA54FF53Au,
         0x510E527Fu, 0x9B05688Cu, 0x1F83D9ABu, 0x5BE0CD19u
@@ -78,6 +83,12 @@ __device__ void blake3_oneblock_words(const uint32_t m[16], uint32_t block_len, 
         {9,14,11,5,8,12,15,1,13,3,0,10,2,6,4,7},
         {11,15,5,0,1,9,8,6,14,10,2,12,3,4,7,13},
     };
+
+    uint32_t m[16] = {0};
+    #pragma unroll
+    for (int i = 0; i < 8; ++i) m[i] = input[i];
+    m[8] = word8;
+    m[9] = word9;
 
     uint32_t v[16];
     #pragma unroll
@@ -104,30 +115,33 @@ __device__ void blake3_oneblock_words(const uint32_t m[16], uint32_t block_len, 
     }
 
     #pragma unroll
-    for (int i = 0; i < 8; ++i) store32(out + i * 4, v[i] ^ v[i + 8]);
+    for (int i = 0; i < 8; ++i) output[i] = v[i] ^ v[i + 8];
 }
 
-__device__ void blake3_40(const uint8_t midstate[32], uint64_t nonce, uint8_t out[32]) {
-    uint32_t words[16] = {0};
+__device__ __forceinline__ void extension_hash_words(
+    const uint8_t midstate[32],
+    uint64_t nonce,
+    uint32_t iterations,
+    uint32_t state[8]) {
+    uint32_t input[8];
     #pragma unroll
-    for (int i = 0; i < 8; ++i) words[i] = load32(midstate + i * 4);
-    words[8] = (uint32_t)nonce;
-    words[9] = (uint32_t)(nonce >> 32);
-    blake3_oneblock_words(words, 40, out);
+    for (int i = 0; i < 8; ++i) input[i] = load32(midstate + i * 4);
+    blake3_compress_words(input, (uint32_t)nonce, (uint32_t)(nonce >> 32), 40, state);
+    for (uint32_t i = 0; i < iterations; ++i) {
+        blake3_compress_words(state, 0, 0, 32, state);
+    }
 }
 
-__device__ void blake3_32_inplace(uint8_t hash[32]) {
-    uint32_t words[16] = {0};
-    #pragma unroll
-    for (int i = 0; i < 8; ++i) words[i] = load32(hash + i * 4);
-    blake3_oneblock_words(words, 32, hash);
+__device__ __forceinline__ uint8_t state_byte(const uint32_t state[8], int index) {
+    return (uint8_t)(state[index >> 2] >> ((index & 3) * 8));
 }
 
-__device__ __forceinline__ bool below_target(const uint8_t hash[32], const uint8_t target[32]) {
+__device__ __forceinline__ bool state_below_target(const uint32_t state[8], const uint8_t target[32]) {
     #pragma unroll
     for (int i = 0; i < 32; ++i) {
-        if (hash[i] < target[i]) return true;
-        if (hash[i] > target[i]) return false;
+        uint8_t byte = state_byte(state, i);
+        if (byte < target[i]) return true;
+        if (byte > target[i]) return false;
     }
     return false;
 }
@@ -143,15 +157,14 @@ __global__ void mine_kernel(
     uint64_t stride = (uint64_t)gridDim.x * blockDim.x;
     for (uint64_t offset = gid; offset < count; offset += stride) {
         uint64_t nonce = base + offset;
-        uint8_t hash[32];
-        blake3_40(midstate, nonce, hash);
-        for (uint32_t i = 0; i < iterations; ++i) blake3_32_inplace(hash);
-        if (below_target(hash, target)) {
+        uint32_t state[8];
+        extension_hash_words(midstate, nonce, iterations, state);
+        if (state_below_target(state, target)) {
             uint32_t index = atomicAdd(&candidates->count, 1u);
             if (index < candidates->cap && index < MAX_CANDIDATES) {
                 candidates->nonce[index] = nonce;
                 #pragma unroll
-                for (int j = 0; j < 32; ++j) candidates->hash[index][j] = hash[j];
+                for (int j = 0; j < 32; ++j) candidates->hash[index][j] = state_byte(state, j);
             }
         }
     }
@@ -162,10 +175,9 @@ __global__ void hash_one_kernel(
     uint64_t nonce,
     uint32_t iterations,
     uint8_t *output) {
-    uint8_t hash[32];
-    blake3_40(midstate, nonce, hash);
-    for (uint32_t i = 0; i < iterations; ++i) blake3_32_inplace(hash);
-    for (int i = 0; i < 32; ++i) output[i] = hash[i];
+    uint32_t state[8];
+    extension_hash_words(midstate, nonce, iterations, state);
+    for (int i = 0; i < 32; ++i) output[i] = state_byte(state, i);
 }
 
 extern "C" int midstate_cuda_device_count() {
@@ -185,7 +197,18 @@ extern "C" int midstate_cuda_device_name(int device, char *output, uint32_t outp
 
 extern "C" MidstateCudaWorker *midstate_cuda_worker_create(
     int device, int blocks, int threads, uint64_t batch, uint32_t iterations) {
-    if (cudaSetDevice(device) != cudaSuccess) return nullptr;
+    cudaError_t select_error = cudaSetDevice(device);
+    if (select_error != cudaSuccess) {
+        fail(select_error, "cudaSetDevice");
+        return nullptr;
+    }
+    if (threads <= 0 || batch == 0) {
+        snprintf(last_error, sizeof(last_error), "threads and batch must be positive");
+        return nullptr;
+    }
+    uint64_t useful_blocks = (batch + (uint64_t)threads - 1) / (uint64_t)threads;
+    if (blocks <= 0 || (uint64_t)blocks > useful_blocks) blocks = (int)useful_blocks;
+    if (blocks < 1) blocks = 1;
     MidstateCudaWorker *worker = new MidstateCudaWorker{};
     worker->device = device;
     worker->blocks = blocks;
