@@ -17,6 +17,7 @@ GTX 1070 Ti: sm_61
 RTX 3090:    sm_86
 RTX 4090:    sm_89
 RTX 5090:    sm_120
+CMP 50HX:    sm_75
 ```
 
 ## Design

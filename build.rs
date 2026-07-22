@@ -13,6 +13,7 @@ fn main() {
         .flag("-Xptxas=-v")
         .flag("-std=c++17")
         .flag("-gencode=arch=compute_61,code=sm_61")
+        .flag("-gencode=arch=compute_75,code=sm_75")
         .flag("-gencode=arch=compute_86,code=sm_86")
         .flag("-gencode=arch=compute_89,code=sm_89")
         .flag("-gencode=arch=compute_120,code=sm_120")
