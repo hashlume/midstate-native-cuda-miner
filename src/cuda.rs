@@ -27,9 +27,16 @@ unsafe extern "C" {
         device: i32,
         blocks: i32,
         threads: i32,
+        chains_per_thread: i32,
         batch: u64,
         iterations: u32,
     ) -> *mut c_void;
+    fn midstate_cuda_worker_config(
+        worker: *mut c_void,
+        blocks: *mut i32,
+        threads: *mut i32,
+        chains: *mut i32,
+    ) -> i32;
     fn midstate_cuda_worker_set_job(
         worker: *mut c_void,
         midstate: *const u8,
@@ -43,8 +50,21 @@ unsafe extern "C" {
         iterations: u32,
         output: *mut u8,
     ) -> i32;
+    fn midstate_cuda_hash_pair(
+        device: i32,
+        midstate: *const u8,
+        nonce: u64,
+        iterations: u32,
+        output: *mut u8,
+    ) -> i32;
     fn midstate_cuda_worker_destroy(worker: *mut c_void);
     fn midstate_cuda_last_error() -> *const c_char;
+    fn midstate_cuda_reference_hash_pair(
+        midstate: *const u8,
+        nonce: u64,
+        iterations: u32,
+        output: *mut u8,
+    );
 }
 
 #[derive(Clone, Debug)]
@@ -170,6 +190,35 @@ fn self_test(device: usize, iterations: u32) -> Result<()> {
             hex::encode(expected)
         );
     }
+    let expected_pair = [
+        extension_hash(&midstate, nonce, iterations),
+        extension_hash(&midstate, nonce.wrapping_add(1), iterations),
+    ];
+    let mut actual_pair = [0u8; 64];
+    let pair_result = unsafe {
+        midstate_cuda_hash_pair(
+            device as i32,
+            midstate.as_ptr(),
+            nonce,
+            iterations,
+            actual_pair.as_mut_ptr(),
+        )
+    };
+    if pair_result != 0 {
+        bail!(
+            "GPU {device} dual-chain self-test failed to run: {}",
+            native_error()
+        );
+    }
+    if actual_pair[..32] != expected_pair[0] || actual_pair[32..] != expected_pair[1] {
+        bail!(
+            "GPU {device} dual-chain self-test mismatch: CUDA0={} CPU0={} CUDA1={} CPU1={}",
+            hex::encode(&actual_pair[..32]),
+            hex::encode(expected_pair[0]),
+            hex::encode(&actual_pair[32..]),
+            hex::encode(expected_pair[1]),
+        );
+    }
     Ok(())
 }
 
@@ -177,6 +226,7 @@ fn self_test(device: usize, iterations: u32) -> Result<()> {
 pub struct WorkerConfig {
     pub blocks: i32,
     pub threads: i32,
+    pub chains_per_thread: i32,
     pub batch: u64,
     pub iterations: u32,
 }
@@ -218,6 +268,7 @@ pub fn start_workers(
                     gpu as i32,
                     config.blocks,
                     config.threads,
+                    config.chains_per_thread,
                     config.batch,
                     config.iterations,
                 )
@@ -225,6 +276,22 @@ pub fn start_workers(
             if worker.is_null() {
                 bail!("GPU {gpu} initialization failed: {}", native_error());
             }
+            let (mut launch_blocks, mut launch_threads, mut chains) = (0, 0, 0);
+            if unsafe {
+                midstate_cuda_worker_config(
+                    worker,
+                    &mut launch_blocks,
+                    &mut launch_threads,
+                    &mut chains,
+                )
+            } != 0
+            {
+                unsafe { midstate_cuda_worker_destroy(worker) };
+                bail!("GPU {gpu} launch configuration query failed");
+            }
+            eprintln!(
+                "gpu{gpu} CUDA launch blocks={launch_blocks} threads={launch_threads} chains/thread={chains}"
+            );
 
             let run = || -> Result<()> {
                 let mut active_generation = 0;
@@ -310,7 +377,7 @@ pub fn start_workers(
 
 #[cfg(test)]
 mod tests {
-    use super::extension_hash;
+    use super::{extension_hash, midstate_cuda_reference_hash_pair};
 
     const IV: [u32; 8] = [
         0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab,
@@ -449,6 +516,29 @@ mod tests {
                 assert_eq!(
                     word_hash(midstate, nonce, iterations),
                     extension_hash(&midstate, nonce, iterations)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn unrolled_cuda_schedule_matches_blake3() {
+        let midstate = [0x5au8; 32];
+        for iterations in [0, 1, 7, 31] {
+            for nonce in [0, 1, 0x0123_4567_89ab_cdef] {
+                let mut actual = [0u8; 64];
+                unsafe {
+                    midstate_cuda_reference_hash_pair(
+                        midstate.as_ptr(),
+                        nonce,
+                        iterations,
+                        actual.as_mut_ptr(),
+                    );
+                }
+                assert_eq!(actual[..32], extension_hash(&midstate, nonce, iterations));
+                assert_eq!(
+                    actual[32..],
+                    extension_hash(&midstate, nonce.wrapping_add(1), iterations)
                 );
             }
         }

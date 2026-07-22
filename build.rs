@@ -10,6 +10,7 @@ fn main() {
         .file("cuda/miner.cu")
         .flag("-O3")
         .flag("--use_fast_math")
+        .flag("-Xptxas=-v")
         .flag("-std=c++17")
         .flag("-gencode=arch=compute_61,code=sm_61")
         .flag("-gencode=arch=compute_86,code=sm_86")

@@ -31,6 +31,11 @@ RTX 5090:    sm_120
 - Clean Ctrl+C shutdown after active CUDA batches finish.
 - Register-resident BLAKE3 chaining state across all one million iterations.
 - Launch grids are clamped to useful nonce work instead of scheduling empty blocks.
+- Blackwell GPUs interleave two independent nonce chains per CUDA thread to hide
+  the sequential integer dependency chain.
+- BLAKE3's seven message schedules are expanded at compile time; the hot loop
+  does not load permutation tables or index a generic message array.
+- The default launch grid is sized from CUDA occupancy and the GPU's SM count.
 
 The pool sees one logical worker because all GPUs deliberately share one
 connection. Per-GPU rates, candidates, jobs, and totals are printed locally.
@@ -56,6 +61,11 @@ Building requires Rust and CUDA 12.8 or newer for RTX 5090 support:
 ```bash
 cargo build --release
 ```
+
+`--blocks 0` (the default) enables occupancy-based launch sizing. Supplying a
+positive value retains manual grid control for benchmarking. On Blackwell,
+`--chains-per-thread 0` selects the dual-chain kernel; pass `1` or `2` to force
+either path for an A/B benchmark.
 
 The GitHub release workflow builds in NVIDIA's CUDA 12.8 development image and
 publishes a packaged Linux x86-64 binary with a SHA-256 checksum.

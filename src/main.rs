@@ -29,10 +29,14 @@ struct Args {
     address: String,
     #[arg(short = 'w', long, default_value = "native-cuda")]
     worker: String,
-    #[arg(long, default_value_t = 4096)]
+    /// CUDA blocks. Zero auto-sizes the grid from SM occupancy.
+    #[arg(long, default_value_t = 0)]
     blocks: i32,
     #[arg(long, default_value_t = 128)]
     threads: i32,
+    /// Independent nonce chains per CUDA thread. Zero selects automatically.
+    #[arg(long, default_value_t = 0, value_parser = clap::value_parser!(i32).range(0..=2))]
+    chains_per_thread: i32,
     #[arg(long, default_value_t = 131_072)]
     batch: u64,
     #[arg(long, default_value_t = 1_000_000, hide = true)]
@@ -313,6 +317,7 @@ async fn main() -> Result<()> {
         WorkerConfig {
             blocks: args.blocks,
             threads: args.threads,
+            chains_per_thread: args.chains_per_thread,
             batch: args.batch,
             iterations: args.iterations,
         },
