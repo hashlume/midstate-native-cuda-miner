@@ -1,6 +1,6 @@
 [package]
 name = "midstate-native-cuda-miner"
-version = "0.3.0-cmp.1"
+version = "0.3.0-cmp.2"
 edition = "2021"
 build = "build.rs"
 

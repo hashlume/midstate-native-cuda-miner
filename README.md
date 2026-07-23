@@ -13,11 +13,14 @@ the release binary.
 Release architecture targets:
 
 ```text
-GTX 1070 Ti: sm_61
-RTX 3090:    sm_86
-RTX 4090:    sm_89
-RTX 5090:    sm_120
-CMP 50HX:    sm_75
+Pascal:      sm_61   GTX 10-series, GTX 1070/1080-class cards
+Volta:       sm_70   V100-class cards
+Turing:      sm_75   RTX 20-series, GTX 16-series, CMP 30/40/50HX
+Ampere DC:   sm_80   A100-class cards
+Ampere:      sm_86   RTX 30-series, RTX A5000/A6000, CMP 70/90HX
+Ada:         sm_89   RTX 40-series, RTX 5000/6000 Ada
+Hopper:      sm_90   H100-class cards
+Blackwell:   sm_120  RTX 50-series, RTX PRO Blackwell cards
 ```
 
 ## Design
@@ -68,8 +71,9 @@ positive value retains manual grid control for benchmarking. On Blackwell,
 `--chains-per-thread 0` selects the dual-chain kernel; pass `1` or `2` to force
 either path for an A/B benchmark.
 
-The GitHub release workflow builds in NVIDIA's CUDA 12.8 development image and
-publishes a packaged Linux x86-64 binary with a SHA-256 checksum.
+The tagged GitHub release workflow builds CUDA 12.8 packages for Linux x86-64
+and Windows x86-64, then publishes both archives with a combined SHA-256
+checksum manifest.
 
 ## Pool Compatibility
 
