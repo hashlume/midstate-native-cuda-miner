@@ -177,6 +177,8 @@ async fn run_connection(
             return Ok(());
         }
         tokio::select! {
+            biased;
+
             line = lines.next_line() => {
                 let Some(line) = line.context("read Stratum line")? else {
                     bail!("pool closed connection");
