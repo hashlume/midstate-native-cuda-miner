@@ -51,7 +51,6 @@ connection. Per-GPU rates, candidates, jobs, and totals are printed locally.
   -o stratum+tcp://n1.us.clorecloud.net:1820 \
   -a YOUR_PAYOUT_ADDRESS \
   -w rig \
-  --batch 131072 \
   --max-submit-per-batch 2 \
   --max-outstanding-shares 32
 ```
@@ -70,6 +69,10 @@ cargo build --release
 positive value retains manual grid control for benchmarking. On Blackwell,
 `--chains-per-thread 0` selects the dual-chain kernel; pass `1` or `2` to force
 either path for an A/B benchmark.
+
+`--batch 0` (the default) auto-selects a per-GPU batch size from detected GPU
+models. It uses a smaller batch for CMP 30/40/50HX-class cards and a larger
+batch for faster Ampere/Ada/Blackwell rigs. Pass `--batch N` to override.
 
 The tagged GitHub release workflow builds CUDA 12.8 packages for Linux x86-64
 and Windows x86-64, then publishes both archives with a combined SHA-256

@@ -37,7 +37,8 @@ struct Args {
     /// Independent nonce chains per CUDA thread. Zero selects automatically.
     #[arg(long, default_value_t = 0, value_parser = clap::value_parser!(i32).range(0..=2))]
     chains_per_thread: i32,
-    #[arg(long, default_value_t = 131_072)]
+    /// Nonces per GPU batch. Zero auto-selects from detected GPU models.
+    #[arg(long, default_value_t = 0)]
     batch: u64,
     #[arg(long, default_value_t = 1_000_000, hide = true)]
     iterations: u32,

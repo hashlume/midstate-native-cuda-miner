@@ -267,6 +267,17 @@ pub struct WorkerConfig {
     pub iterations: u32,
 }
 
+fn auto_batch_for_devices(names: &[String]) -> u64 {
+    if names.iter().any(|name| {
+        let upper = name.to_ascii_uppercase();
+        upper.contains("CMP 30") || upper.contains("CMP 40") || upper.contains("CMP 50")
+    }) {
+        32_768
+    } else {
+        65_536
+    }
+}
+
 pub fn start_workers(
     config: WorkerConfig,
     jobs: Arc<SharedJob>,
@@ -278,10 +289,20 @@ pub fn start_workers(
         bail!("no NVIDIA CUDA devices found");
     }
 
+    let names = (0..count)
+        .map(|gpu| device_name(gpu).with_context(|| format!("GPU {gpu}")))
+        .collect::<Result<Vec<_>>>()?;
+    let config = if config.batch == 0 {
+        let batch = auto_batch_for_devices(&names);
+        eprintln!("auto CUDA batch={} for {} GPU(s)", batch, count);
+        WorkerConfig { batch, ..config }
+    } else {
+        config
+    };
+
     let mut stats = Vec::with_capacity(count);
     let mut handles = Vec::with_capacity(count);
-    for gpu in 0..count {
-        let name = device_name(gpu).with_context(|| format!("GPU {gpu}"))?;
+    for (gpu, name) in names.into_iter().enumerate() {
         let gpu_stats = Arc::new(WorkerStats {
             name,
             hashes: AtomicU64::new(0),
@@ -408,7 +429,7 @@ pub fn start_workers(
 
 #[cfg(test)]
 mod tests {
-    use super::{extension_hash, midstate_cuda_reference_hash_pair};
+    use super::{auto_batch_for_devices, extension_hash, midstate_cuda_reference_hash_pair};
 
     const IV: [u32; 8] = [
         0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab,
@@ -550,6 +571,22 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn auto_batch_prefers_smaller_batches_for_slow_cmp_cards() {
+        assert_eq!(
+            auto_batch_for_devices(&["NVIDIA CMP 50HX".to_string()]),
+            32_768
+        );
+        assert_eq!(
+            auto_batch_for_devices(&["NVIDIA CMP 90HX".to_string()]),
+            65_536
+        );
+        assert_eq!(
+            auto_batch_for_devices(&["NVIDIA GeForce RTX 5090".to_string()]),
+            65_536
+        );
     }
 
     #[test]
