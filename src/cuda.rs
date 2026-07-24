@@ -1,4 +1,6 @@
+use std::collections::hash_map::RandomState;
 use std::ffi::{c_char, c_void, CStr};
+use std::hash::{BuildHasher, Hash, Hasher};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::thread;
@@ -99,16 +101,37 @@ impl WorkerStats {
     }
 }
 
-#[derive(Default)]
 pub struct SharedJob {
     generation: AtomicU64,
+    nonce_cursor: AtomicU64,
+    process_entropy: u64,
     job: RwLock<Option<Job>>,
+}
+
+impl Default for SharedJob {
+    fn default() -> Self {
+        let state = RandomState::new();
+        let mut hasher = state.build_hasher();
+        std::process::id().hash(&mut hasher);
+        std::time::SystemTime::now().hash(&mut hasher);
+        (&state as *const RandomState as usize).hash(&mut hasher);
+        Self {
+            generation: AtomicU64::new(0),
+            nonce_cursor: AtomicU64::new(0),
+            process_entropy: hasher.finish(),
+            job: RwLock::new(None),
+        }
+    }
 }
 
 impl SharedJob {
     pub fn publish(&self, mut job: Job) -> Job {
         let generation = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
         job.generation = generation;
+        self.nonce_cursor.store(
+            job_nonce_seed(&job, generation, self.process_entropy),
+            Ordering::SeqCst,
+        );
         *self.job.write().unwrap() = Some(job.clone());
         job
     }
@@ -121,6 +144,19 @@ impl SharedJob {
     fn current(&self) -> Option<Job> {
         self.job.read().unwrap().clone()
     }
+
+    fn claim_nonce_range(&self, batch: u64) -> u64 {
+        self.nonce_cursor.fetch_add(batch, Ordering::SeqCst)
+    }
+}
+
+fn job_nonce_seed(job: &Job, generation: u64, process_entropy: u64) -> u64 {
+    let mut seed_bytes = [0u8; 8];
+    seed_bytes.copy_from_slice(&job.midstate[..8]);
+    u64::from_le_bytes(seed_bytes)
+        ^ job.id.rotate_left(17)
+        ^ generation.wrapping_mul(0x9e37_79b9_7f4a_7c15)
+        ^ process_entropy
 }
 
 fn native_error() -> String {
@@ -259,7 +295,6 @@ pub fn start_workers(
         let jobs = jobs.clone();
         let stop = stop.clone();
         let events = events.clone();
-        let gpu_count = count as u64;
         let config = WorkerConfig { ..config };
         handles.push(thread::spawn(move || {
             self_test(gpu, config.iterations)?;
@@ -299,10 +334,6 @@ pub fn start_workers(
                 let mut share_target = [0xff; 32];
                 share_target[0] = 0x00;
                 share_target[1] = 0x0f;
-                let seed = ((std::process::id() as u64) << 32)
-                    ^ (gpu as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
-                let mut base = seed.wrapping_add((gpu as u64).wrapping_mul(config.batch));
-
                 while !stop.load(Ordering::Relaxed) {
                     let Some(job) = jobs.current() else {
                         thread::sleep(Duration::from_millis(100));
@@ -324,12 +355,12 @@ pub fn start_workers(
                         gpu_stats.job_id.store(job.id, Ordering::Relaxed);
                     }
 
+                    let base = jobs.claim_nonce_range(config.batch);
                     let mut native: NativeResult = unsafe { std::mem::zeroed() };
                     let result = unsafe { midstate_cuda_worker_mine(worker, base, &mut native) };
                     if result != 0 {
                         bail!("GPU {gpu} batch failed: {}", native_error());
                     }
-                    base = base.wrapping_add(config.batch.wrapping_mul(gpu_count));
                     let count = usize::min(native.count as usize, MAX_CANDIDATES);
                     let candidates = (0..count)
                         .map(|index| Candidate {
