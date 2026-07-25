@@ -93,8 +93,6 @@ pub struct WorkerStats {
     pub candidates: AtomicU64,
     pub hps_bits: AtomicU64,
     pub job_id: AtomicU64,
-    pub nonce_start: AtomicU64,
-    pub nonce_end: AtomicU64,
 }
 
 impl WorkerStats {
@@ -312,8 +310,6 @@ pub fn start_workers(
             candidates: AtomicU64::new(0),
             hps_bits: AtomicU64::new(0.0f64.to_bits()),
             job_id: AtomicU64::new(0),
-            nonce_start: AtomicU64::new(0),
-            nonce_end: AtomicU64::new(0),
         });
         stats.push(gpu_stats.clone());
 
@@ -381,10 +377,6 @@ pub fn start_workers(
                     }
 
                     let base = jobs.claim_nonce_range(config.batch);
-                    gpu_stats.nonce_start.store(base, Ordering::Relaxed);
-                    gpu_stats
-                        .nonce_end
-                        .store(base.wrapping_add(config.batch.saturating_sub(1)), Ordering::Relaxed);
                     let mut native: NativeResult = unsafe { std::mem::zeroed() };
                     let result = unsafe { midstate_cuda_worker_mine(worker, base, &mut native) };
                     if result != 0 {

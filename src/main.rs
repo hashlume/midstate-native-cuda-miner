@@ -130,16 +130,12 @@ fn print_status(
         stats.blocks_submitted.load(Ordering::Relaxed),
     );
     for (gpu, worker) in workers.iter().enumerate() {
-        let nonce_start = worker.nonce_start.load(Ordering::Relaxed);
-        let nonce_end = worker.nonce_end.load(Ordering::Relaxed);
         eprintln!(
-            "  gpu{} {} rate={} hashes={} nonce_range={:#018x}-{:#018x} job={}",
+            "  gpu{} {} rate={} hashes={} job={}",
             gpu,
             worker.name,
             format_rate(worker.hps()),
             worker.hashes.load(Ordering::Relaxed),
-            nonce_start,
-            nonce_end,
             worker.job_id.load(Ordering::Relaxed),
         );
     }
