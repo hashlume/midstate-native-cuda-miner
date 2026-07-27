@@ -352,9 +352,6 @@ pub fn start_workers(
             let run = || -> Result<()> {
                 let mut active_generation = 0;
                 let mut active_job = 0;
-                let mut share_target = [0xff; 32];
-                share_target[0] = 0x00;
-                share_target[1] = 0x0f;
                 while !stop.load(Ordering::Relaxed) {
                     let Some(job) = jobs.current() else {
                         thread::sleep(Duration::from_millis(100));
@@ -365,7 +362,7 @@ pub fn start_workers(
                             midstate_cuda_worker_set_job(
                                 worker,
                                 job.midstate.as_ptr(),
-                                share_target.as_ptr(),
+                                job.share_target.as_ptr(),
                             )
                         };
                         if result != 0 {

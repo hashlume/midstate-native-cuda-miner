@@ -6,6 +6,7 @@ pub struct Job {
     pub generation: u64,
     pub id: u64,
     pub midstate: [u8; 32],
+    pub share_target: [u8; 32],
     pub network_target: [u8; 32],
 }
 
@@ -58,10 +59,19 @@ pub fn parse_job(message: &Value, generation: u64) -> Result<Option<Job>> {
             u8::try_from(byte).map_err(|_| anyhow!("network target byte {index} exceeds 255"))?;
     }
 
+    let mut share_target = [0xff; 32];
+    share_target[0] = 0x00;
+    share_target[1] = 0x0f;
+    if let Some(share_target_hex) = params.get(3).and_then(Value::as_str) {
+        hex::decode_to_slice(share_target_hex, &mut share_target)
+            .context("invalid 32-byte share target")?;
+    }
+
     Ok(Some(Job {
         generation,
         id,
         midstate,
+        share_target,
         network_target,
     }))
 }
@@ -102,7 +112,23 @@ mod tests {
         assert_eq!(job.generation, 7);
         assert_eq!(job.id, 42);
         assert_eq!(job.midstate, [0xaa; 32]);
+        assert_eq!(job.share_target[0], 0);
+        assert_eq!(job.share_target[1], 0x0f);
         assert_eq!(job.network_target[31], 31);
+    }
+
+    #[test]
+    fn parses_optional_share_target() {
+        let target: Vec<u8> = (0..32).map(|i| i as u8).collect();
+        let message = json!({
+            "id": null,
+            "method": "mining.notify",
+            "params": [42, "aa".repeat(32), { "target": target }, "0004ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"],
+        });
+        let job = parse_job(&message, 7).unwrap().unwrap();
+        assert_eq!(job.share_target[0], 0x00);
+        assert_eq!(job.share_target[1], 0x04);
+        assert_eq!(job.share_target[2], 0xff);
     }
 
     #[test]

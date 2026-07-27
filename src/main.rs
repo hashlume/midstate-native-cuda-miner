@@ -190,10 +190,11 @@ async fn run_connection(
                 if let Some(job) = parse_job(&message, *generation_seed)? {
                     let job = jobs.publish(job);
                     eprintln!(
-                        "new job {} generation={} midstate={} target={}",
+                        "new job {} generation={} midstate={} share_target={} network_target={}",
                         job.id,
                         job.generation,
                         hex::encode(job.midstate),
+                        hex::encode(job.share_target),
                         hex::encode(job.network_target),
                     );
                     current_job = Some(job);
